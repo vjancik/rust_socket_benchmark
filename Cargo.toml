@@ -1,0 +1,18 @@
+[package]
+name = "socket_bench"
+version = "0.1.0"
+authors = ["Viktor Jancik <viktor.vix.jancik@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1.0.38"
+lazy_static = "1.4.0"
+nix = "0.19.1"
+num_cpus = "1.13.0"
+smallvec = "1.6.1"
+socket2 = { version = "0.3.19", features = ["reuseport"] }
+
+[[bin]]
+name = "benchmark"
