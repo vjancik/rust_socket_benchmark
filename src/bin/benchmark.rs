@@ -357,7 +357,7 @@ lazy_static! {
         let threads = smallvec![1, 2, num_cpus::get()];
         let conn_m = smallvec![ConnectionMode::Unconnected, ConnectionMode::Connected];
         let ip_proto = smallvec![IPProtocol::V4, IPProtocol::V6];
-        let duration = smallvec![Duration::from_millis(100)];
+        let duration = smallvec![Duration::from_millis(1000)];
         let warmup = smallvec![Duration::from_millis(100)];
         let payload_sz = smallvec![26, 300, 1460];
         let rev_var_order: SmallVec<[String; 7]> = smallvec!["payload_sz".to_string(), "warmup".to_string(), "duration".to_string(),
