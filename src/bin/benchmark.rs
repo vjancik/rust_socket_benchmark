@@ -9,8 +9,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::cmp;
 use std::default::Default;
 use std::collections::HashMap;
+use std::future::Future;
 use socket2;
 use mio;
+use tokio;
+use futures::FutureExt;
 // use nix::sys::socket as nix_sock;
 use smallvec::{smallvec, SmallVec};
 use num_cpus;
@@ -102,7 +105,7 @@ fn bytes_to_megabits(bytes: u64) -> f64 {
     (bytes * 8) as f64 / 1000f64 / 1000f64
 }
 
-fn error_printer<T, F: FnOnce() -> Result<T> + Send>(f: F) -> impl FnOnce() -> Result<T> + Send {
+fn error_printer<T, F: FnOnce() -> Result<T> + Send>(f: F) -> impl FnOnce() -> F::Output + Send {
     move || {
         match f() {
             Err(e) => {
@@ -111,6 +114,16 @@ fn error_printer<T, F: FnOnce() -> Result<T> + Send>(f: F) -> impl FnOnce() -> R
             },
             any => any
         }
+    }
+}
+
+async fn async_error_printer<T, F: Future<Output=Result<T>>>(f: F) -> F::Output {
+    match f.await {
+        Err(e) => {
+            eprintln!("{}", e);
+            Err(e)
+        },
+        any => any
     }
 }
 
@@ -126,7 +139,7 @@ enum ConnectionMode {
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum SocketType {
-    StdUdp, MioUdp, MioUdpExhaustive
+    StdUdp, MioUdp, MioUdpExhaustive, TokioUdp, TokioUdpSyncExhaustive,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -211,6 +224,7 @@ struct TestSuiteBuilder {
 }
 
 impl TestSuiteBuilder {
+    #[allow(dead_code)]
     pub fn new() -> Self {
         TestSuiteBuilder { suite: Default::default() }
     }
@@ -340,7 +354,9 @@ lazy_static! {
     static ref DEFAULT_TEST_SUITE: TestSuite = {
         let mut fields = HashMap::new();
         fields.insert("socket_t".to_owned(), 
-            smallvec![ConfigValue::SocketT(SocketType::StdUdp), ConfigValue::SocketT(SocketType::MioUdp), ConfigValue::SocketT(SocketType::MioUdpExhaustive)]);
+            smallvec![ConfigValue::SocketT(SocketType::StdUdp), 
+            ConfigValue::SocketT(SocketType::MioUdp), ConfigValue::SocketT(SocketType::MioUdpExhaustive),
+            ConfigValue::SocketT(SocketType::TokioUdp), ConfigValue::SocketT(SocketType::TokioUdpSyncExhaustive)]);
         fields.insert("threads".to_owned(), 
             smallvec![ConfigValue::Threads(1), ConfigValue::Threads(2), ConfigValue::Threads(num_cpus::get())]);
         fields.insert("conn_m".to_owned(),
@@ -655,13 +671,6 @@ fn test_mio_udp_socket_async(config: &TestConfig) -> Result<(u64, Duration)> {
         IPProtocol::V6 => SocketAddr::V6(*IPV6_RX),
     };
 
-    // const SENDER: Token = Token(0);
-    // const RECEIVER: Token = Token(1);
-
-    // let mut poll = Poll::new()?;
-    // poll.registry().register(&mut udp_tx, SENDER, Interest::WRITABLE)?;
-    // poll.registry().register(&mut udp_rx, RECEIVER, Interest::READABLE)?;
-
     let barrier = Arc::new(DoubleBarrier::new(config.threads as usize + 1));
     let timers = Arc::new([Timer::new(&config.warmup), Timer::new(&config.duration)]);
 
@@ -778,6 +787,150 @@ fn test_mio_udp_socket_async(config: &TestConfig) -> Result<(u64, Duration)> {
     Ok((bytes_recv, max_duration))
 }
 
+async fn test_tokio_udp_socket_recv_task(
+    udp_rx_addr: SocketAddr, barriers: Arc<[tokio::sync::Barrier]>, config: TestConfig, timers: Arc<[Timer]>
+) -> Result<(u64, Duration)> {
+    let mut data = [1u8; 1500];
+    let mut bytes_recv = 0u64;
+    let mut start = Instant::now();
+
+    use socket2::{Domain, Type, Protocol};
+    let udp_rx = match &config.ip_proto {
+        IPProtocol::V4 => socket2::Socket::new(Domain::ipv4(), Type::dgram(), Some(Protocol::udp()))?,
+        IPProtocol::V6 => socket2::Socket::new(Domain::ipv6(), Type::dgram(), Some(Protocol::udp()))?,
+    };
+
+    let udp_rx: UdpSocket = if config.threads <= 2 {
+        udp_rx.bind(&udp_rx_addr.into())?;
+        udp_rx.into()
+    } else {
+        udp_rx.set_reuse_port(true)?;
+        udp_rx.bind(&udp_rx_addr.into())?;
+        udp_rx.into()
+    };
+    udp_rx.set_nonblocking(true)?;
+    let udp_rx = tokio::net::UdpSocket::from_std(udp_rx)?;
+
+    for timer in timers.iter() {
+        bytes_recv = 0;
+        for barrier in barriers.iter() { barrier.wait().await; }
+        start = Instant::now();
+        // TODO: may hang
+        while !timer.is_expired() {
+            // TODO: SyncExhaustive
+            let recv_res = match config.conn_m {
+                ConnectionMode::Connected => {
+                    tokio::time::timeout(Duration::from_millis(10), udp_rx.recv(&mut data[..config.payload_sz])).await
+                },
+                ConnectionMode::Unconnected => {
+                    tokio::time::timeout(Duration::from_millis(10), 
+                        udp_rx.recv_from(&mut data[..config.payload_sz])
+                            .map(|res| res.map(|ok_val| ok_val.0 ))
+                    ).await
+                }
+            };
+            match recv_res {
+                Err(_) => Ok(Ok(0)),
+                any => any
+            }??;
+
+            bytes_recv += config.payload_sz as u64;
+        }
+    }
+    Ok((bytes_recv, Instant::now() - start))
+}
+
+async fn test_tokio_udp_socket_send_task(
+    udp_tx_addr: SocketAddr, udp_rx_addr: SocketAddr, barriers: Arc<[tokio::sync::Barrier]>, config: TestConfig, timers: Arc<[Timer]>
+) -> Result<()> {
+    let data = [1u8; 1500];
+
+    let udp_tx = tokio::net::UdpSocket::bind(udp_tx_addr).await?;
+    if let ConnectionMode::Connected = config.conn_m {
+        udp_tx.connect(udp_rx_addr).await?;
+    }
+
+    for timer in timers.iter() {
+        for barrier in barriers.iter() { barrier.wait().await; }
+        while !timer.is_expired() {
+            // TODO: SyncExhaustive
+            match config.conn_m {
+                ConnectionMode::Connected => {
+                    udp_tx.send(&data[..config.payload_sz]).await?;
+                },
+                ConnectionMode::Unconnected => {
+                    udp_tx.send_to(&data[..config.payload_sz], &udp_rx_addr).await?;
+                }
+            };
+
+            if config.threads == 1 {
+                tokio::task::yield_now().await;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn test_tokio_udp_socket_main_routine(config: &TestConfig) -> Result<(u64, Duration)> {
+    use tokio::sync::Barrier;
+    use tokio::task;
+
+    let mut bytes_recv = 0u64;
+    let mut max_duration = Duration::from_nanos(0);
+
+    let udp_tx_addr = match &config.ip_proto {
+        IPProtocol::V4 => SocketAddr::V4(*IPV4_TX),
+        IPProtocol::V6 => SocketAddr::V6(*IPV6_TX),
+    };
+    let udp_rx_addr = match &config.ip_proto {
+        IPProtocol::V4 => SocketAddr::V4(*IPV4_RX),
+        IPProtocol::V6 => SocketAddr::V6(*IPV6_RX),
+    };
+
+    let barriers = Arc::new([Barrier::new(config.threads as usize + 1), Barrier::new(config.threads as usize + 1)]);
+    let timers = Arc::new([Timer::new(&config.warmup), Timer::new(&config.duration)]);
+
+    let mut send_tasks: SmallVec<[task::JoinHandle<Result<()>>; 16]> = SmallVec::new();
+    let mut recv_tasks: SmallVec<[task::JoinHandle<Result<(u64, Duration)>>; 16]> = SmallVec::new();
+
+    for _thread_ix in 0..cmp::max(config.threads / 2, 1) {
+        // async closures with return values are experimental
+        let recv_task = task::spawn(async_error_printer(test_tokio_udp_socket_recv_task(
+            udp_rx_addr, barriers.clone(), config.clone(), timers.clone())));
+        recv_tasks.push(recv_task);
+
+        let send_task = task::spawn(async_error_printer(test_tokio_udp_socket_send_task(
+            udp_tx_addr, udp_rx_addr, barriers.clone(), config.clone(), timers.clone())));
+        send_tasks.push(send_task);
+        }
+        
+    for timer in timers.iter() {
+        barriers[0].wait().await;
+        timer.start();
+        barriers[1].wait().await;
+    }
+
+    for task in send_tasks {
+        task.await??;
+    }
+
+    for task in recv_tasks {
+        let (res, dur) = task.await??;
+        bytes_recv += res;
+        max_duration = cmp::max(max_duration, dur);
+    }
+    Ok((bytes_recv, max_duration))
+} 
+
+fn test_tokio_udp_socket(config: &TestConfig) -> Result<(u64, Duration)> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(config.threads)
+        .build()?;
+    rt.block_on(test_tokio_udp_socket_main_routine(&config))
+}
+
 fn run_test(config: &TestConfig) -> Result<()> {
     // redundant configurations for early returning
     match config {
@@ -785,11 +938,14 @@ fn run_test(config: &TestConfig) -> Result<()> {
         _ => ()
     };
 
+    // TODO: dedeup
     let (bytes_sent, elapsed) = match config.threads {
         1 => {
             match config.socket_t {
                 SocketType::StdUdp => test_std_udp_socket_sync(config)?,
                 SocketType::MioUdp => test_mio_udp_socket_sync(config)?,
+                SocketType::TokioUdp | SocketType::TokioUdpSyncExhaustive
+                    => test_tokio_udp_socket(config)?,
                 _ => return Err(anyhow!("Unimplemented"))
             }
         }
@@ -798,6 +954,9 @@ fn run_test(config: &TestConfig) -> Result<()> {
                 SocketType::StdUdp => test_std_udp_socket_async(config)?,
                 SocketType::MioUdp | SocketType::MioUdpExhaustive 
                     => test_mio_udp_socket_async(config)?,
+                SocketType::TokioUdp | SocketType::TokioUdpSyncExhaustive
+                => test_tokio_udp_socket(config)?,
+                // #[allow(unreachable_pattern)]
                 // _ => return Err(anyhow!("Unimplemented"))
             }
         }
@@ -810,6 +969,7 @@ fn run_test(config: &TestConfig) -> Result<()> {
 fn main() -> Result<()> {
     let mut test_suite = TestSuiteBuilder::default();
     // test_suite.set_variable("threads", [ConfigValue::Threads(2), ConfigValue::Threads(4)]);
+    test_suite.set_variable("socket_t", [ConfigValue::SocketT(SocketType::MioUdpExhaustive), ConfigValue::SocketT(SocketType::TokioUdp)]);
     test_suite.set_fixed("ip_proto", ConfigValue::IpProto(IPProtocol::V4));
     test_suite.set_fixed("conn_m", ConfigValue::ConnM(ConnectionMode::Connected));
     test_suite.set_fixed("payload_sz", ConfigValue::PayloadSz(300));

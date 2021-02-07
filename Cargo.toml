@@ -8,12 +8,14 @@ edition = "2018"
 
 [dependencies]
 anyhow = "1.0.38"
+futures = "0.3.12"
 lazy_static = "1.4.0"
 mio = { version = "0.7.7", features = ["net", "os-poll"] }
 nix = "0.19.1"
 num_cpus = "1.13.0"
 smallvec = "1.6.1"
 socket2 = { version = "0.3.19", features = ["reuseport"] }
+tokio = { version = "1.2.0", features = ["full"] }
 
 [[bin]]
 name = "benchmark"
