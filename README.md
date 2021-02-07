@@ -2,14 +2,14 @@
 
 ## rust_socket_benchmark
 
-Exhaustive Rust UDP socket benchmark from multiple libraries (std, socket2*, nix*, futures*, tokio*)
+Exhaustive Rust UDP socket benchmark from multiple libraries (std, socket2*, nix*, mio, tokio*)
 
 ### TODO
 - [ ] socket2 socket
 - [ ] reuseaddr / reuseport comparison
 - [ ] CLI for partial test suite running
 - [ ] nix socket and platform-gating
-- [ ] Futures socket
+- [x] mio socket
 - [ ] Tokio socket
 
 ### Example results

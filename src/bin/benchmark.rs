@@ -10,6 +10,7 @@ use std::cmp;
 use std::default::Default;
 use std::collections::HashMap;
 use socket2;
+use mio;
 // use nix::sys::socket as nix_sock;
 use smallvec::{smallvec, SmallVec};
 use num_cpus;
@@ -17,14 +18,14 @@ use anyhow::anyhow;
 
 type Result<T> = std::result::Result<T, anyhow::Error>;
 
-struct Timeout {
+struct Timer {
     _duration: Duration,
     started: Arc<AtomicBool>,
     expired: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
-impl Timeout {
+impl Timer {
     pub fn new(d: &Duration) -> Self {
         let started = Arc::new(AtomicBool::new(false));
         let expired = Arc::new(AtomicBool::new(false));
@@ -42,7 +43,7 @@ impl Timeout {
             })
         });
 
-        Timeout { 
+        Timer { 
             _duration: d.clone(), started, expired, thread
         }
     }
@@ -63,7 +64,7 @@ impl Timeout {
     }
 }
 
-impl Drop for Timeout {
+impl Drop for Timer {
     fn drop(&mut self) {
         self.thread.take().unwrap().join().ok();
     }
@@ -97,7 +98,7 @@ impl DoubleBarrier {
 }
 
 #[inline(always)]
-fn bytes_to_megabits(bytes: u64) -> f64{
+fn bytes_to_megabits(bytes: u64) -> f64 {
     (bytes * 8) as f64 / 1000f64 / 1000f64
 }
 
@@ -125,7 +126,7 @@ enum ConnectionMode {
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum SocketType {
-    StdUdp
+    StdUdp, MioUdp, MioUdpExhaustive
 }
 
 #[derive(Debug, Default, Clone)]
@@ -133,9 +134,38 @@ struct PartialTestConfig {
     fields: HashMap<String, ConfigValue>,
 }
 
+#[allow(unused_macros)]
+macro_rules! anon {
+    ( $( $field_name:ident : $value:expr ),+ ) => {
+        {
+            // Abusing field_name by using it also as type's name.
+            // #[derive(Debug, Clone, Eq, PartialEq, PartialOrd)]
+            #[allow(non_camel_case_types)]
+            struct Anon<$( $field_name ),*> {
+                $(
+                    $field_name: $field_name,
+                )*
+            }
+            Anon {
+                $(
+                    $field_name: $value,
+                )*
+            }
+        }
+    }
+}
+
 macro_rules! as_variant {
-    ($variant:path, $val:expr ) => { match $val {
+    (struct, { $( $field_name:ident ),+ } , $variant:path, $val:expr ) => { match $val {
+        $variant{ $( $field_name ),+ } => anon!{ $( $field_name : $field_name ),+ },
+        _ => panic!("Invalid enum variant"),
+    }};
+    (tuple, 1, $variant:path, $val:expr ) => { match $val {
         $variant(val) => val,
+        _ => panic!("Invalid enum variant"),
+    }};
+    (tuple, 2, $variant:path, $val:expr ) => { match $val {
+        $variant(val1, val2) => (val1, val2),
         _ => panic!("Invalid enum variant"),
     }};
 }
@@ -143,13 +173,13 @@ macro_rules! as_variant {
 impl PartialTestConfig {
     pub fn finalize(mut self) -> TestConfig {
         TestConfig {
-            socket_t: as_variant!(ConfigValue::SocketT, self.fields.remove("socket_t").unwrap()),
-            threads: as_variant!(ConfigValue::Threads, self.fields.remove("threads").unwrap()),
-            conn_m: as_variant!(ConfigValue::ConnM, self.fields.remove("conn_m").unwrap()),
-            ip_proto: as_variant!(ConfigValue::IpProto, self.fields.remove("ip_proto").unwrap()),
-            duration: as_variant!(ConfigValue::Duration, self.fields.remove("duration").unwrap()),
-            warmup: as_variant!(ConfigValue::Warmup, self.fields.remove("warmup").unwrap()),
-            payload_sz: as_variant!(ConfigValue::PayloadSz, self.fields.remove("payload_sz").unwrap()),
+            socket_t: as_variant!(tuple, 1, ConfigValue::SocketT, self.fields.remove("socket_t").unwrap()),
+            threads: as_variant!(tuple, 1, ConfigValue::Threads, self.fields.remove("threads").unwrap()),
+            conn_m: as_variant!(tuple, 1, ConfigValue::ConnM, self.fields.remove("conn_m").unwrap()),
+            ip_proto: as_variant!(tuple, 1, ConfigValue::IpProto, self.fields.remove("ip_proto").unwrap()),
+            duration: as_variant!(tuple, 1, ConfigValue::Duration, self.fields.remove("duration").unwrap()),
+            warmup: as_variant!(tuple, 1, ConfigValue::Warmup, self.fields.remove("warmup").unwrap()),
+            payload_sz: as_variant!(tuple, 1, ConfigValue::PayloadSz, self.fields.remove("payload_sz").unwrap()),
         }
     }
 }
@@ -189,6 +219,20 @@ impl TestSuiteBuilder {
         TestSuiteBuilder { suite: DEFAULT_TEST_SUITE.clone() }
     }
 
+    pub fn set_fixed<S: AsRef<str>>(&mut self, field_name: S, field_value: ConfigValue) {
+        if let None = TestSuite::field_names().iter().find(|entry| **entry == field_name.as_ref()) {
+            panic!("Invalid field name");
+        }
+        self.suite.fields.insert(field_name.as_ref().to_owned(), smallvec![field_value]);
+    }
+
+    pub fn set_variable<S: AsRef<str>, T: AsRef<[ConfigValue]>>(&mut self, field_name: S, options: T) {
+        if let None = TestSuite::field_names().iter().find(|entry| **entry == field_name.as_ref()) {
+            panic!("Invalid field name");
+        }
+        self.suite.fields.insert(field_name.as_ref().to_owned(), SmallVec::from(options.as_ref()));
+    }
+
     pub fn finish(mut self) -> Result<TestSuite> {
         self.suite.validate()?;
 
@@ -214,13 +258,6 @@ impl TestSuiteBuilder {
 #[derive(Debug, Clone, Default)]
 struct TestSuite {
     fields: HashMap<String, SmallVec<[ConfigValue; 4]>>,
-    // socket_t: SmallVec<[SocketType; 1]>,
-    // threads: SmallVec<[usize; 3]>,
-    // conn_m: SmallVec<[ConnectionMode; 2]>,
-    // ip_proto: SmallVec<[IPProtocol; 2]>,
-    // duration: SmallVec<[Duration; 2]>,
-    // warmup: SmallVec<[Duration; 2]>,
-    // payload_sz: SmallVec<[usize; 4]>,
     // order of variance, from last field to be varied on, to the first field
     rev_var_order: SmallVec<[String; 7]>,
 }
@@ -303,7 +340,7 @@ lazy_static! {
     static ref DEFAULT_TEST_SUITE: TestSuite = {
         let mut fields = HashMap::new();
         fields.insert("socket_t".to_owned(), 
-            smallvec![ConfigValue::SocketT(SocketType::StdUdp)]);
+            smallvec![ConfigValue::SocketT(SocketType::StdUdp), ConfigValue::SocketT(SocketType::MioUdp), ConfigValue::SocketT(SocketType::MioUdpExhaustive)]);
         fields.insert("threads".to_owned(), 
             smallvec![ConfigValue::Threads(1), ConfigValue::Threads(2), ConfigValue::Threads(num_cpus::get())]);
         fields.insert("conn_m".to_owned(),
@@ -331,6 +368,7 @@ lazy_static! {
 fn test_std_udp_socket_sync(config: &TestConfig) -> Result<(u64, Duration)> {
     let mut data = [1u8; 1500];
     let mut bytes_recv = 0u64;
+    let mut start = Instant::now();
 
     let udp_tx_addr = match &config.ip_proto {
         IPProtocol::V4 => SocketAddr::V4(*IPV4_TX),
@@ -346,38 +384,24 @@ fn test_std_udp_socket_sync(config: &TestConfig) -> Result<(u64, Duration)> {
         udp_tx.connect(udp_rx_addr)?;
     }
 
-    let warmup = Timeout::new(&config.warmup);
-    warmup.start();
-    while !warmup.is_expired() {
-        match &config.conn_m {
-            ConnectionMode::Connected => {
-                udp_tx.send(&data[..config.payload_sz])?;
-                udp_rx.recv(&mut data[..config.payload_sz])?;
-            },
-            ConnectionMode::Unconnected => {
-                udp_tx.send_to(&data[..config.payload_sz], &udp_rx_addr)?;
-                udp_rx.recv_from(&mut data[..config.payload_sz])?;
+    let timers = [Timer::new(&config.warmup), Timer::new(&config.duration)];
+    for timer in timers.iter() {
+        bytes_recv = 0;
+        timer.start();
+        start = Instant::now();
+        while !timer.is_expired() {
+            match &config.conn_m {
+                ConnectionMode::Connected => {
+                    udp_tx.send(&data[..config.payload_sz])?;
+                    udp_rx.recv(&mut data[..config.payload_sz])?;
+                },
+                ConnectionMode::Unconnected => {
+                    udp_tx.send_to(&data[..config.payload_sz], &udp_rx_addr)?;
+                    udp_rx.recv_from(&mut data[..config.payload_sz])?;
+                }
             }
+            bytes_recv += config.payload_sz as u64;
         }
-        bytes_recv += config.payload_sz as u64;
-    }
-    bytes_recv = 0;
-
-    let timeout = Timeout::new(&config.duration);
-    timeout.start();
-    let start = Instant::now();
-    while !timeout.is_expired() {
-        match &config.conn_m {
-            ConnectionMode::Connected => {
-                udp_tx.send(&data[..config.payload_sz])?;
-                udp_rx.recv(&mut data[..config.payload_sz])?;
-            },
-            ConnectionMode::Unconnected => {
-                udp_tx.send_to(&data[..config.payload_sz], &udp_rx_addr)?;
-                udp_rx.recv_from(&mut data[..config.payload_sz])?;
-            }
-        }
-        bytes_recv += config.payload_sz as u64;
     }
 
     Ok((bytes_recv, Instant::now() - start))
@@ -397,8 +421,7 @@ fn test_std_udp_socket_async(config: &TestConfig) -> Result<(u64, Duration)> {
     };
 
     let barrier = Arc::new(DoubleBarrier::new(config.threads as usize + 1));
-    let warmup = Arc::new(Timeout::new(&config.warmup));
-    let timeout = Arc::new(Timeout::new(&config.duration));
+    let timers = Arc::new([Timer::new(&config.warmup), Timer::new(&config.duration)]);
 
     let mut send_threads: SmallVec<[thread::JoinHandle<Result<()>>; 16]> = SmallVec::new();
     let mut recv_threads: SmallVec<[thread::JoinHandle<Result<(u64, Duration)>>; 16]> = SmallVec::new();
@@ -407,12 +430,12 @@ fn test_std_udp_socket_async(config: &TestConfig) -> Result<(u64, Duration)> {
         {
         let barrier = barrier.clone();
         let config = config.clone();
-        let warmup = warmup.clone();
-        let timeout = timeout.clone();
+        let timers = timers.clone();
 
         let recv_thread = thread::spawn(error_printer(move || -> Result<(u64, Duration)> {
             let mut data = [1u8; 1500];
             let mut bytes_recv = 0u64;
+            let mut start = Instant::now();
 
             use socket2::{Domain, Type, Protocol};
             let udp_rx = match &config.ip_proto {
@@ -430,37 +453,23 @@ fn test_std_udp_socket_async(config: &TestConfig) -> Result<(u64, Duration)> {
             };
             udp_rx.set_nonblocking(true)?;
 
-            barrier.wait();
-            while !warmup.is_expired() {
-                let recv_res = match config.conn_m {
-                    ConnectionMode::Connected => udp_rx.recv(&mut data[..config.payload_sz]),
-                    ConnectionMode::Unconnected => udp_rx.recv_from(&mut data[..config.payload_sz]).map(|res| res.0 ),
-                };
+            for timer in timers.iter() {
+                bytes_recv = 0;
+                barrier.wait();
+                start = Instant::now();
+                while !timer.is_expired() {
+                    let recv_res = match config.conn_m {
+                        ConnectionMode::Connected => udp_rx.recv(&mut data[..config.payload_sz]),
+                        ConnectionMode::Unconnected => udp_rx.recv_from(&mut data[..config.payload_sz]).map(|res| res.0 ),
+                    };
 
-                match recv_res {
-                    Ok(_) => { bytes_recv += config.payload_sz as u64; },
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::yield_now();
+                    match recv_res {
+                        Ok(_) => { bytes_recv += config.payload_sz as u64; },
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::yield_now();
+                        }
+                        Err(e) => panic!(e)
                     }
-                    Err(e) => panic!(e)
-                }
-            }
-            bytes_recv = 0;
-
-            barrier.wait();
-            let start = Instant::now();
-            while !timeout.is_expired() {
-                let recv_res = match config.conn_m {
-                    ConnectionMode::Connected => udp_rx.recv(&mut data[..config.payload_sz]),
-                    ConnectionMode::Unconnected => udp_rx.recv_from(&mut data[..config.payload_sz]).map(|res| res.0 ),
-                };
-
-                match recv_res {
-                    Ok(_) => { bytes_recv += config.payload_sz as u64; },
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::yield_now();
-                    }
-                    Err(e) => panic!(e)
                 }
             }
 
@@ -472,8 +481,7 @@ fn test_std_udp_socket_async(config: &TestConfig) -> Result<(u64, Duration)> {
         {
         let barrier = barrier.clone();
         let config = config.clone();
-        let warmup = warmup.clone();
-        let timeout = timeout.clone();
+        let timers = timers.clone();
 
         let send_thread = thread::spawn(error_printer(move || -> Result<()> {
             let data = [1u8; 1500];
@@ -484,49 +492,33 @@ fn test_std_udp_socket_async(config: &TestConfig) -> Result<(u64, Duration)> {
                 udp_tx.connect(udp_rx_addr)?;
             }
 
-            barrier.wait();
-            while !warmup.is_expired() {
-                let send_res = match config.conn_m {
-                    ConnectionMode::Connected => udp_tx.send(&data[..config.payload_sz]),
-                    ConnectionMode::Unconnected => udp_tx.send_to(&data[..config.payload_sz], udp_rx_addr),
-                };
-                match send_res {
-                    Ok(_) => (),
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::yield_now();
+            for timer in timers.iter() {
+                barrier.wait();
+                while !timer.is_expired() {
+                    let send_res = match config.conn_m {
+                        ConnectionMode::Connected => udp_tx.send(&data[..config.payload_sz]),
+                        ConnectionMode::Unconnected => udp_tx.send_to(&data[..config.payload_sz], udp_rx_addr),
+                    };
+                    match send_res {
+                        Ok(_) => (),
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::yield_now();
+                        }
+                        Err(e) => panic!(e)
                     }
-                    Err(e) => panic!(e)
                 }
             }
-
-            barrier.wait();
-            while !timeout.is_expired() {
-                let send_res = match config.conn_m {
-                    ConnectionMode::Connected => udp_tx.send(&data[..config.payload_sz]),
-                    ConnectionMode::Unconnected => udp_tx.send_to(&data[..config.payload_sz], udp_rx_addr),
-                };
-                match send_res {
-                    Ok(_) => (),
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::yield_now();
-                    }
-                    Err(e) => panic!(e)
-                }
-            }
-            
             Ok(())
         }));
         send_threads.push(send_thread);
         }
     }
 
-    barrier.wait_first();
-    warmup.start();
-    barrier.wait_second();
-
-    barrier.wait_first();
-    timeout.start();
-    barrier.wait_second();
+    for timer in timers.iter() {
+        barrier.wait_first();
+        timer.start();
+        barrier.wait_second();
+    }
 
     for thread in send_threads {
         thread.join().unwrap()?;
@@ -540,21 +532,173 @@ fn test_std_udp_socket_async(config: &TestConfig) -> Result<(u64, Duration)> {
     Ok((bytes_recv, max_duration))
 }
 
-fn run_test(config: &TestConfig) -> Result<()> {
-    println!("{:?}", config);
-    let (bytes_sent, elapsed) = match config.threads {
-        1 => test_std_udp_socket_sync(config)?,
-        _ => test_std_udp_socket_async(config)?
+#[inline(always)]
+fn mio_udp_socket_send_single_handler(udp_tx: &mut mio::net::UdpSocket, udp_rx_addr: &SocketAddr, data: &[u8; 1500], config: &TestConfig) -> Result<()> {
+    let send_res = match config.conn_m {
+        ConnectionMode::Connected => {
+            udp_tx.send(&data[..config.payload_sz])
+        },
+        ConnectionMode::Unconnected => {
+            udp_tx.send_to(&data[..config.payload_sz], *udp_rx_addr)
+        }
     };
+    match send_res {
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
+        Err(e) => panic!(e),
+        _ => Ok(())
+    }
+}
+
+#[inline(always)]
+fn mio_udp_socket_send_handler(udp_tx: &mut mio::net::UdpSocket, udp_rx_addr: &SocketAddr, data: &[u8; 1500], config: &TestConfig, timer: &Timer) -> Result<()> {
+    while !timer.is_expired() {
+        mio_udp_socket_send_single_handler(udp_tx, udp_rx_addr, data, config)?;
+        // don't exhaust socket
+        if let SocketType::MioUdp = config.socket_t { break }
+    }
+    Ok(())
+}
+
+#[inline(always)]
+fn mio_udp_socket_recv_single_handler(udp_rx: &mut mio::net::UdpSocket, data: &mut [u8; 1500], config: &TestConfig) -> Result<u64> {
+    let send_res = match config.conn_m {
+        ConnectionMode::Connected => {
+            udp_rx.recv(&mut data[..config.payload_sz])
+        },
+        ConnectionMode::Unconnected => {
+            udp_rx.recv_from(&mut data[..config.payload_sz]).map(|res| res.0 )
+        }
+    };
+    match send_res {
+        Ok(_) => Ok(config.payload_sz as u64),
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(0),
+        Err(e) => panic!(e),
+    }
+}
+
+#[inline(always)]
+fn mio_udp_socket_recv_handler(udp_rx: &mut mio::net::UdpSocket, data: &mut [u8; 1500], config: &TestConfig, timer: &Timer) -> Result<u64> {
+    let mut bytes_recv = 0;
+    while !timer.is_expired() {
+        bytes_recv += mio_udp_socket_recv_single_handler(udp_rx, data, config)?;
+        // don't exhaust socket
+        if let SocketType::MioUdp = config.socket_t { break }
+    }
+    Ok(bytes_recv)
+}
+
+fn test_mio_udp_socket_sync(config: &TestConfig) -> Result<(u64, Duration)> {
+    use mio::{Events, Interest, Poll, Token};
+
+    let mut data = [1u8; 1500];
+    let mut bytes_recv = 0u64;
+    let mut start = Instant::now();
+
+    let udp_tx_addr = match &config.ip_proto {
+        IPProtocol::V4 => SocketAddr::V4(*IPV4_TX),
+        IPProtocol::V6 => SocketAddr::V6(*IPV6_TX),
+    };
+    let udp_rx_addr = match &config.ip_proto {
+        IPProtocol::V4 => SocketAddr::V4(*IPV4_RX),
+        IPProtocol::V6 => SocketAddr::V6(*IPV6_RX),
+    };
+
+    let mut udp_tx = mio::net::UdpSocket::bind(udp_tx_addr)?;
+    let mut udp_rx = mio::net::UdpSocket::bind(udp_rx_addr)?;
+    if let ConnectionMode::Connected = config.conn_m {
+        udp_tx.connect(udp_rx_addr)?;
+    }
+
+    const SENDER: Token = Token(0);
+    const RECEIVER: Token = Token(1);
+
+    let mut poll = Poll::new()?;
+    poll.registry().register(&mut udp_tx, SENDER, Interest::WRITABLE)?;
+    poll.registry().register(&mut udp_rx, RECEIVER, Interest::READABLE)?;
+
+    let mut events = Events::with_capacity(128);
+
+    let timers = [Timer::new(&config.warmup), Timer::new(&config.duration)];
+    for timer in timers.iter() {
+        bytes_recv = 0;
+        timer.start();
+        start = Instant::now();
+        while !timer.is_expired() {
+            poll.poll(&mut events, Some(Duration::from_millis(10)))?;
+            for event in events.iter() {
+                match event.token() {
+                    SENDER => mio_udp_socket_send_single_handler(&mut udp_tx, &udp_rx_addr, &data, config)?,
+                    RECEIVER => {
+                        bytes_recv += mio_udp_socket_recv_single_handler(&mut udp_rx, &mut data, config)?;
+                    },
+                    _ => unreachable!()
+                }
+            }
+        }
+    }
+
+    Ok((bytes_recv, Instant::now() - start))
+}
+
+fn run_test(config: &TestConfig) -> Result<()> {
+    // redundant configurations for early returning
+    match config {
+        TestConfig { threads: 1, socket_t: SocketType::MioUdpExhaustive, .. } => return Ok(()),
+        _ => ()
+    };
+
+    let (bytes_sent, elapsed) = match config.threads {
+        1 => {
+            match config.socket_t {
+                SocketType::StdUdp => test_std_udp_socket_sync(config)?,
+                SocketType::MioUdp => test_mio_udp_socket_sync(config)?,
+                _ => return Err(anyhow!("Unimplemented"))
+            }
+        }
+        _ => {
+            match config.socket_t {
+                SocketType::StdUdp => test_std_udp_socket_async(config)?,
+                _ => return Err(anyhow!("Unimplemented"))
+            }
+        }
+    };
+    println!("{:?}", config);
     println!("\tBandwidth: {:7.2} Mb/sec", bytes_to_megabits(bytes_sent) / elapsed.as_secs_f64());
     Ok(())
 }
 
 fn main() -> Result<()> {
-    let test_suite = TestSuiteBuilder::default().finish()?;
+    let mut test_suite = TestSuiteBuilder::default();
+    test_suite.set_fixed("threads", ConfigValue::Threads(1));
+    test_suite.set_fixed("ip_proto", ConfigValue::IpProto(IPProtocol::V4));
+    test_suite.set_fixed("conn_m", ConfigValue::ConnM(ConnectionMode::Connected));
+    // test_suite.set_fixed("payload_sz", ConfigValue::PayloadSz(300));
+    let test_suite = test_suite.finish()?;
+    
     for test_config in test_suite.iter() {
         run_test(&test_config)?;
     }
     
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+
+    #[derive(Debug)]
+    enum TestTuple {
+        // OneTuple(usize),
+        TwoTuple(usize, usize),
+        TestStruct {
+            test_field: usize
+        }
+    }
+
+    #[test]
+    fn as_variant_macro() {
+        let test_enum = TestTuple::TwoTuple(1,2);
+        let test_struct = TestTuple::TestStruct { test_field: 1 };
+        println!("{}", as_variant!(tuple, 2, TestTuple::TwoTuple, test_enum).1);
+        println!("{}", as_variant!(struct, { test_field }, TestTuple::TestStruct, test_struct).test_field);
+    }
 }
