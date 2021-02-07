@@ -8,6 +8,7 @@ use std::sync::{self, Arc};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::cmp;
 use std::default::Default;
+use std::collections::HashMap;
 use socket2;
 // use nix::sys::socket as nix_sock;
 use smallvec::{smallvec, SmallVec};
@@ -127,29 +128,41 @@ enum SocketType {
     StdUdp
 }
 
-#[derive(Debug, Default, Clone, PartialEq)]
+#[derive(Debug, Default, Clone)]
 struct PartialTestConfig {
-    socket_t: Option<SocketType>,
-    threads: Option<usize>,
-    conn_m: Option<ConnectionMode>,
-    ip_proto: Option<IPProtocol>,
-    duration: Option<Duration>,
-    warmup: Option<Duration>,
-    payload_sz: Option<usize>,
+    fields: HashMap<String, ConfigValue>,
+}
+
+macro_rules! as_variant {
+    ($variant:path, $val:expr ) => { match $val {
+        $variant(val) => val,
+        _ => panic!("Invalid enum variant"),
+    }};
 }
 
 impl PartialTestConfig {
-    pub fn finalize(self) -> TestConfig {
+    pub fn finalize(mut self) -> TestConfig {
         TestConfig {
-            socket_t: self.socket_t.unwrap(),
-            threads: self.threads.unwrap(),
-            conn_m: self.conn_m.unwrap(),
-            ip_proto: self.ip_proto.unwrap(),
-            duration: self.duration.unwrap(),
-            warmup: self.warmup.unwrap(),
-            payload_sz: self.payload_sz.unwrap(),
+            socket_t: as_variant!(ConfigValue::SocketT, self.fields.remove("socket_t").unwrap()),
+            threads: as_variant!(ConfigValue::Threads, self.fields.remove("threads").unwrap()),
+            conn_m: as_variant!(ConfigValue::ConnM, self.fields.remove("conn_m").unwrap()),
+            ip_proto: as_variant!(ConfigValue::IpProto, self.fields.remove("ip_proto").unwrap()),
+            duration: as_variant!(ConfigValue::Duration, self.fields.remove("duration").unwrap()),
+            warmup: as_variant!(ConfigValue::Warmup, self.fields.remove("warmup").unwrap()),
+            payload_sz: as_variant!(ConfigValue::PayloadSz, self.fields.remove("payload_sz").unwrap()),
         }
     }
+}
+
+#[derive(Debug, Clone)]
+enum ConfigValue {
+    SocketT(SocketType),
+    Threads(usize),
+    ConnM(ConnectionMode),
+    IpProto(IPProtocol),
+    Duration(Duration),
+    Warmup(Duration),
+    PayloadSz(usize),
 }
 
 #[derive(Clone, Debug)]
@@ -200,13 +213,14 @@ impl TestSuiteBuilder {
 
 #[derive(Debug, Clone, Default)]
 struct TestSuite {
-    socket_t: SmallVec<[SocketType; 1]>,
-    threads: SmallVec<[usize; 3]>,
-    conn_m: SmallVec<[ConnectionMode; 2]>,
-    ip_proto: SmallVec<[IPProtocol; 2]>,
-    duration: SmallVec<[Duration; 2]>,
-    warmup: SmallVec<[Duration; 2]>,
-    payload_sz: SmallVec<[usize; 4]>,
+    fields: HashMap<String, SmallVec<[ConfigValue; 4]>>,
+    // socket_t: SmallVec<[SocketType; 1]>,
+    // threads: SmallVec<[usize; 3]>,
+    // conn_m: SmallVec<[ConnectionMode; 2]>,
+    // ip_proto: SmallVec<[IPProtocol; 2]>,
+    // duration: SmallVec<[Duration; 2]>,
+    // warmup: SmallVec<[Duration; 2]>,
+    // payload_sz: SmallVec<[usize; 4]>,
     // order of variance, from last field to be varied on, to the first field
     rev_var_order: SmallVec<[String; 7]>,
 }
@@ -227,12 +241,15 @@ impl TestSuite {
         });
         valid_fields?;
 
-        if self.socket_t.len() < 1 || self.threads.len() < 1 || 
-            self.conn_m.len() < 1 || self. ip_proto.len() < 1 ||
-            self.duration.len() < 1 || self.warmup.len() < 1 ||
-            self.payload_sz.len() < 1
-        {
-            return Err(anyhow!("Incomplete TestSuite specification"))
+        for field in TestSuite::field_names() {
+            match self.fields.get(*field) {
+                Some(array) => {
+                    if array.len() < 1 {
+                        return Err(anyhow!("Incomplete TestSuite specification"))
+                    }
+                },
+                None => return Err(anyhow!("Missing field"))
+            }
         }
         Ok(())
     }
@@ -249,6 +266,7 @@ struct TestSuiteIterator<'a> {
     variant_indexes: [usize; 7]
 }
 
+// TODO: ConfigValue enum, as_variant! macro
 // Ripe for reflection
 impl<'a> TestSuiteIterator<'a> {
     // returns true if the subtree has been fully exhausted
@@ -256,85 +274,15 @@ impl<'a> TestSuiteIterator<'a> {
         if field_ix == self.variant_indexes.len() {
             return true
         }
-        match self.src.rev_var_order[field_ix].as_str() {
-            "socket_t" => {
-                pconfig.socket_t = Some(self.src.socket_t[self.variant_indexes[field_ix]]);
-                if self.expand(field_ix + 1, pconfig) {
-                    if self.variant_indexes[field_ix] < self.src.socket_t.len() - 1 {
-                        self.variant_indexes[field_ix] += 1;
-                    } else {
-                        self.variant_indexes[field_ix] = 0;
-                        return true
-                    }
-                }
-            },
-            "threads" => {
-                pconfig.threads = Some(self.src.threads[self.variant_indexes[field_ix]]);
-                if self.expand(field_ix + 1, pconfig) {
-                    if self.variant_indexes[field_ix] < self.src.threads.len() - 1 {
-                        self.variant_indexes[field_ix] += 1;
-                    } else {
-                        self.variant_indexes[field_ix] = 0;
-                        return true
-                    }
-                }
-            },
-            "conn_m" => {
-                pconfig.conn_m = Some(self.src.conn_m[self.variant_indexes[field_ix]]);
-                if self.expand(field_ix + 1, pconfig) {
-                    if self.variant_indexes[field_ix] < self.src.conn_m.len() - 1 {
-                        self.variant_indexes[field_ix] += 1;
-                    } else {
-                        self.variant_indexes[field_ix] = 0;
-                        return true
-                    }
-                }
-            },
-            "ip_proto" => {
-                pconfig.ip_proto = Some(self.src.ip_proto[self.variant_indexes[field_ix]]);
-                if self.expand(field_ix + 1, pconfig) {
-                    if self.variant_indexes[field_ix] < self.src.ip_proto.len() - 1 {
-                        self.variant_indexes[field_ix] += 1;
-                    } else {
-                        self.variant_indexes[field_ix] = 0;
-                        return true
-                    }
-                }
-            },
-            "duration" => {
-                pconfig.duration = Some(self.src.duration[self.variant_indexes[field_ix]]);
-                if self.expand(field_ix + 1, pconfig) {
-                    if self.variant_indexes[field_ix] < self.src.duration.len() - 1 {
-                        self.variant_indexes[field_ix] += 1;
-                    } else {
-                        self.variant_indexes[field_ix] = 0;
-                        return true
-                    }
-                }
-            },
-            "warmup" => {
-                pconfig.warmup = Some(self.src.warmup[self.variant_indexes[field_ix]]);
-                if self.expand(field_ix + 1, pconfig) {
-                    if self.variant_indexes[field_ix] < self.src.warmup.len() - 1 {
-                        self.variant_indexes[field_ix] += 1;
-                    } else {
-                        self.variant_indexes[field_ix] = 0;
-                        return true
-                    }
-                }
-            },
-            "payload_sz" => {
-                pconfig.payload_sz = Some(self.src.payload_sz[self.variant_indexes[field_ix]]);
-                if self.expand(field_ix + 1, pconfig) {
-                    if self.variant_indexes[field_ix] < self.src.payload_sz.len() - 1 {
-                        self.variant_indexes[field_ix] += 1;
-                    } else {
-                        self.variant_indexes[field_ix] = 0;
-                        return true
-                    }
-                }
-            },
-            _ => panic!("Invalid field name")
+        let curr_field_name = &self.src.rev_var_order[field_ix];
+        pconfig.fields.insert(curr_field_name.clone(), self.src.fields.get(curr_field_name).unwrap()[self.variant_indexes[field_ix]].clone());
+        if self.expand(field_ix + 1, pconfig) {
+            if self.variant_indexes[field_ix] < self.src.fields.get(curr_field_name).unwrap().len() - 1 {
+                self.variant_indexes[field_ix] += 1;
+            } else {
+                self.variant_indexes[field_ix] = 0;
+                return true
+            }
         }
         false
     }
@@ -353,17 +301,23 @@ impl<'a> Iterator for TestSuiteIterator<'a> {
 
 lazy_static! {
     static ref DEFAULT_TEST_SUITE: TestSuite = {
-        let socket_t = smallvec![SocketType::StdUdp];
-        let threads = smallvec![1, 2, num_cpus::get()];
-        let conn_m = smallvec![ConnectionMode::Unconnected, ConnectionMode::Connected];
-        let ip_proto = smallvec![IPProtocol::V4, IPProtocol::V6];
-        let duration = smallvec![Duration::from_millis(1000)];
-        let warmup = smallvec![Duration::from_millis(100)];
-        let payload_sz = smallvec![26, 300, 1460];
-        let rev_var_order: SmallVec<[String; 7]> = smallvec!["payload_sz".to_string(), "warmup".to_string(), "duration".to_string(),
-            "threads".to_string(), "ip_proto".to_string(), "conn_m".to_string(), "socket_t".to_string()];
+        let mut fields = HashMap::new();
+        fields.insert("socket_t".to_owned(), 
+            smallvec![ConfigValue::SocketT(SocketType::StdUdp)]);
+        fields.insert("threads".to_owned(), 
+            smallvec![ConfigValue::Threads(1), ConfigValue::Threads(2), ConfigValue::Threads(num_cpus::get())]);
+        fields.insert("conn_m".to_owned(),
+            smallvec![ConfigValue::ConnM(ConnectionMode::Unconnected), ConfigValue::ConnM(ConnectionMode::Connected)]);
+        fields.insert("ip_proto".to_owned(), 
+            smallvec![ConfigValue::IpProto(IPProtocol::V4), ConfigValue::IpProto(IPProtocol::V6)]);
+        fields.insert("duration".to_owned(), smallvec![ConfigValue::Duration(Duration::from_millis(1000))]);
+        fields.insert("warmup".to_owned(), smallvec![ConfigValue::Warmup(Duration::from_millis(100))]);
+        fields.insert("payload_sz".to_owned(), 
+            smallvec![ConfigValue::PayloadSz(26), ConfigValue::PayloadSz(300), ConfigValue::PayloadSz(1460)]);
+        let rev_var_order: SmallVec<[String; 7]> = smallvec!["payload_sz".to_owned(), "warmup".to_owned(), "duration".to_owned(),
+            "threads".to_owned(), "ip_proto".to_owned(), "conn_m".to_owned(), "socket_t".to_owned()];
 
-        TestSuite { socket_t, threads, conn_m, ip_proto, duration, warmup, payload_sz, rev_var_order }
+        TestSuite { fields, rev_var_order }
     };
 }
 
