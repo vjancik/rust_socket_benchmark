@@ -12,9 +12,9 @@ Exhaustive Rust UDP socket benchmark from multiple libraries (std, socket2*, nix
 - [x] mio socket
 - [ ] Tokio socket
 
-### Example results
+### Example results (Raspberry PI 4B (4GB))
 
-Basic benchmark results from **Raspberry Pi 4B (4GB)**. The **Bandwidth** results represent the throughput (layer 3 payload bytes) on the receiving socket with the threads being divided equally between send (using separate socket addresses) and receive (using the same socket address) sockets.
+The **Bandwidth** results represent the throughput (UDP payload bytes) on the receiving socket with the threads being divided equally between send (using separate socket addresses) and receive (using the same socket address) sockets.
 
 ```
 TestConfig { socket_t: StdUdp, threads: 1, conn_m: Unconnected, ip_proto: V4, duration: 1s, warmup: 100ms, payload_sz: 26 }
@@ -89,4 +89,50 @@ TestConfig { socket_t: StdUdp, threads: 4, conn_m: Unconnected, ip_proto: V6, du
         Bandwidth: 1334.42 Mb/sec
 TestConfig { socket_t: StdUdp, threads: 4, conn_m: Connected, ip_proto: V6, duration: 1s, warmup: 100ms, payload_sz: 1460 }
         Bandwidth: 2147.36 Mb/sec
+```
+
+#### Mio vs Std socket comparison
+
+The `MioUdp` bandwidth numbers are inconsistent, because sporadically (but consistently) the underlying event queue doesn't issue a new READABLE / WRITABLE event immediatelly if the underlying resource (device) wasn't previously exhausted. `MioUdpExhaustive` performs this behavior which corresponds to correct `mio` resource usage.
+
+`MioUdpExhaustive` isn't implemented for `threads: 1` because socket buffer exhaustion on a single thread in the alloted time leads to starvation of the other socket needed for communication.
+
+```
+TestConfig { socket_t: StdUdp, threads: 1, conn_m: Connected, ip_proto: V4, duration: 1s, warmup: 100ms, payload_sz: 300 }
+        Bandwidth:  185.93 Mb/sec
+TestConfig { socket_t: MioUdp, threads: 1, conn_m: Connected, ip_proto: V4, duration: 1s, warmup: 100ms, payload_sz: 300 }
+        Bandwidth:  125.31 Mb/sec
+TestConfig { socket_t: StdUdp, threads: 2, conn_m: Connected, ip_proto: V4, duration: 1s, warmup: 100ms, payload_sz: 300 }
+        Bandwidth:  245.79 Mb/sec
+TestConfig { socket_t: MioUdp, threads: 2, conn_m: Connected, ip_proto: V4, duration: 1s, warmup: 100ms, payload_sz: 300 }
+        Bandwidth:  123.44 Mb/sec
+TestConfig { socket_t: MioUdpExhaustive, threads: 2, conn_m: Connected, ip_proto: V4, duration: 1s, warmup: 100ms, payload_sz: 300 }
+        Bandwidth:  210.03 Mb/sec
+TestConfig { socket_t: StdUdp, threads: 4, conn_m: Connected, ip_proto: V4, duration: 1s, warmup: 100ms, payload_sz: 300 }
+        Bandwidth:  444.04 Mb/sec
+TestConfig { socket_t: MioUdp, threads: 4, conn_m: Connected, ip_proto: V4, duration: 1s, warmup: 100ms, payload_sz: 300 }
+        Bandwidth:  120.07 Mb/sec
+TestConfig { socket_t: MioUdpExhaustive, threads: 4, conn_m: Connected, ip_proto: V4, duration: 1s, warmup: 100ms, payload_sz: 300 }
+        Bandwidth:  404.58 Mb/sec
+```
+
+Notice the inconsistency of the result of the last test. This may occur due to late event handling start caused by delayed first event issuing. This may be solved by attempting to use (read / write) the underlying resource first before polling for events. (TODO: Solve under `socket_t: MioUdpExhaustiveEdge`)
+
+```
+TestConfig { socket_t: StdUdp, threads: 1, conn_m: Connected, ip_proto: V4, duration: 1s, warmup: 100ms, payload_sz: 300 }
+        Bandwidth:  182.87 Mb/sec
+TestConfig { socket_t: MioUdp, threads: 1, conn_m: Connected, ip_proto: V4, duration: 1s, warmup: 100ms, payload_sz: 300 }
+        Bandwidth:  125.67 Mb/sec
+TestConfig { socket_t: StdUdp, threads: 2, conn_m: Connected, ip_proto: V4, duration: 1s, warmup: 100ms, payload_sz: 300 }
+        Bandwidth:  243.84 Mb/sec
+TestConfig { socket_t: MioUdp, threads: 2, conn_m: Connected, ip_proto: V4, duration: 1s, warmup: 100ms, payload_sz: 300 }
+        Bandwidth:  123.40 Mb/sec
+TestConfig { socket_t: MioUdpExhaustive, threads: 2, conn_m: Connected, ip_proto: V4, duration: 1s, warmup: 100ms, payload_sz: 300 }
+        Bandwidth:  204.15 Mb/sec
+TestConfig { socket_t: StdUdp, threads: 4, conn_m: Connected, ip_proto: V4, duration: 1s, warmup: 100ms, payload_sz: 300 }
+        Bandwidth:  437.70 Mb/sec
+TestConfig { socket_t: MioUdp, threads: 4, conn_m: Connected, ip_proto: V4, duration: 1s, warmup: 100ms, payload_sz: 300 }
+        Bandwidth:    1.63 Mb/sec
+TestConfig { socket_t: MioUdpExhaustive, threads: 4, conn_m: Connected, ip_proto: V4, duration: 1s, warmup: 100ms, payload_sz: 300 }
+        Bandwidth:  346.98 Mb/sec
 ```

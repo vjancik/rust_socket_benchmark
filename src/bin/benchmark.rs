@@ -561,7 +561,7 @@ fn mio_udp_socket_send_handler(udp_tx: &mut mio::net::UdpSocket, udp_rx_addr: &S
 
 #[inline(always)]
 fn mio_udp_socket_recv_single_handler(udp_rx: &mut mio::net::UdpSocket, data: &mut [u8; 1500], config: &TestConfig) -> Result<u64> {
-    let send_res = match config.conn_m {
+    let recv_res = match config.conn_m {
         ConnectionMode::Connected => {
             udp_rx.recv(&mut data[..config.payload_sz])
         },
@@ -569,7 +569,7 @@ fn mio_udp_socket_recv_single_handler(udp_rx: &mut mio::net::UdpSocket, data: &m
             udp_rx.recv_from(&mut data[..config.payload_sz]).map(|res| res.0 )
         }
     };
-    match send_res {
+    match recv_res {
         Ok(_) => Ok(config.payload_sz as u64),
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(0),
         Err(e) => panic!(e),
@@ -640,6 +640,144 @@ fn test_mio_udp_socket_sync(config: &TestConfig) -> Result<(u64, Duration)> {
     Ok((bytes_recv, Instant::now() - start))
 }
 
+fn test_mio_udp_socket_async(config: &TestConfig) -> Result<(u64, Duration)> {
+    use mio::{Events, Interest, Poll, Token};
+
+    let mut bytes_recv = 0u64;
+    let mut max_duration = Duration::from_nanos(0);
+
+    let udp_tx_addr = match &config.ip_proto {
+        IPProtocol::V4 => SocketAddr::V4(*IPV4_TX),
+        IPProtocol::V6 => SocketAddr::V6(*IPV6_TX),
+    };
+    let udp_rx_addr = match &config.ip_proto {
+        IPProtocol::V4 => SocketAddr::V4(*IPV4_RX),
+        IPProtocol::V6 => SocketAddr::V6(*IPV6_RX),
+    };
+
+    // const SENDER: Token = Token(0);
+    // const RECEIVER: Token = Token(1);
+
+    // let mut poll = Poll::new()?;
+    // poll.registry().register(&mut udp_tx, SENDER, Interest::WRITABLE)?;
+    // poll.registry().register(&mut udp_rx, RECEIVER, Interest::READABLE)?;
+
+    let barrier = Arc::new(DoubleBarrier::new(config.threads as usize + 1));
+    let timers = Arc::new([Timer::new(&config.warmup), Timer::new(&config.duration)]);
+
+    let mut send_threads: SmallVec<[thread::JoinHandle<Result<()>>; 16]> = SmallVec::new();
+    let mut recv_threads: SmallVec<[thread::JoinHandle<Result<(u64, Duration)>>; 16]> = SmallVec::new();
+
+    for _thread_ix in 0..(config.threads / 2) {
+        {
+        let barrier = barrier.clone();
+        let config = config.clone();
+        let timers = timers.clone();
+
+        let recv_thread = thread::spawn(error_printer(move || -> Result<(u64, Duration)> {
+            let mut data = [1u8; 1500];
+            let mut bytes_recv = 0u64;
+            let mut start = Instant::now();
+
+            use socket2::{Domain, Type, Protocol};
+            let udp_rx = match &config.ip_proto {
+                IPProtocol::V4 => socket2::Socket::new(Domain::ipv4(), Type::dgram(), Some(Protocol::udp()))?,
+                IPProtocol::V6 => socket2::Socket::new(Domain::ipv6(), Type::dgram(), Some(Protocol::udp()))?,
+            };
+
+            let udp_rx: UdpSocket = if config.threads <= 2 {
+                udp_rx.bind(&udp_rx_addr.into())?;
+                udp_rx.into()
+            } else {
+                udp_rx.set_reuse_port(true)?;
+                udp_rx.bind(&udp_rx_addr.into())?;
+                udp_rx.into()
+            };
+            udp_rx.set_nonblocking(true)?;
+            let mut udp_rx = mio::net::UdpSocket::from_std(udp_rx);
+            
+            let mut events = Events::with_capacity(128);
+            const RECEIVER: Token = Token(1);
+            let mut poll = Poll::new()?;
+            poll.registry().register(&mut udp_rx, RECEIVER, Interest::READABLE)?;
+
+            for timer in timers.iter() {
+                bytes_recv = 0;
+                barrier.wait();
+                start = Instant::now();
+                while !timer.is_expired() {
+                    poll.poll(&mut events, Some(Duration::from_millis(10)))?;
+                    for event in events.iter() {
+                        match event.token() {
+                            RECEIVER => {
+                                bytes_recv += mio_udp_socket_recv_handler(&mut udp_rx, &mut data, &config, timer)?;
+                            },
+                            _ => unreachable!()
+                        }
+                    }
+                }
+            }
+
+            Ok((bytes_recv, Instant::now() - start))
+        }));
+        recv_threads.push(recv_thread);
+        }
+
+        {
+        let barrier = barrier.clone();
+        let config = config.clone();
+        let timers = timers.clone();
+
+        let send_thread = thread::spawn(error_printer(move || -> Result<()> {
+            let data = [1u8; 1500];
+
+            let mut udp_tx = mio::net::UdpSocket::bind(udp_tx_addr)?;
+            if let ConnectionMode::Connected = config.conn_m {
+                udp_tx.connect(udp_rx_addr)?;
+            }
+            
+            let mut events = Events::with_capacity(128);
+            const SENDER: Token = Token(0);
+            let mut poll = Poll::new()?;
+            poll.registry().register(&mut udp_tx, SENDER, Interest::WRITABLE)?;
+
+            for timer in timers.iter() {
+                barrier.wait();
+                while !timer.is_expired() {
+                    poll.poll(&mut events, Some(Duration::from_millis(10)))?;
+                    for event in events.iter() {
+                        match event.token() {
+                            SENDER => mio_udp_socket_send_handler(&mut udp_tx, &udp_rx_addr, &data, &config, timer)?,
+                            _ => unreachable!(),
+                        }
+                    }
+                }
+            }
+
+            Ok(())
+        }));
+        send_threads.push(send_thread);
+        }
+    }
+
+    for timer in timers.iter() {
+        barrier.wait_first();
+        timer.start();
+        barrier.wait_second();
+    }
+
+    for thread in send_threads {
+        thread.join().unwrap()?;
+    }
+
+    for thread in recv_threads {
+        let (res, dur) = thread.join().unwrap()?;
+        bytes_recv += res;
+        max_duration = cmp::max(max_duration, dur);
+    }
+    Ok((bytes_recv, max_duration))
+}
+
 fn run_test(config: &TestConfig) -> Result<()> {
     // redundant configurations for early returning
     match config {
@@ -658,7 +796,9 @@ fn run_test(config: &TestConfig) -> Result<()> {
         _ => {
             match config.socket_t {
                 SocketType::StdUdp => test_std_udp_socket_async(config)?,
-                _ => return Err(anyhow!("Unimplemented"))
+                SocketType::MioUdp | SocketType::MioUdpExhaustive 
+                    => test_mio_udp_socket_async(config)?,
+                // _ => return Err(anyhow!("Unimplemented"))
             }
         }
     };
@@ -669,10 +809,10 @@ fn run_test(config: &TestConfig) -> Result<()> {
 
 fn main() -> Result<()> {
     let mut test_suite = TestSuiteBuilder::default();
-    test_suite.set_fixed("threads", ConfigValue::Threads(1));
+    // test_suite.set_variable("threads", [ConfigValue::Threads(2), ConfigValue::Threads(4)]);
     test_suite.set_fixed("ip_proto", ConfigValue::IpProto(IPProtocol::V4));
     test_suite.set_fixed("conn_m", ConfigValue::ConnM(ConnectionMode::Connected));
-    // test_suite.set_fixed("payload_sz", ConfigValue::PayloadSz(300));
+    test_suite.set_fixed("payload_sz", ConfigValue::PayloadSz(300));
     let test_suite = test_suite.finish()?;
     
     for test_config in test_suite.iter() {
