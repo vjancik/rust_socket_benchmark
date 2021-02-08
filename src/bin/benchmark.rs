@@ -467,7 +467,8 @@ fn test_std_udp_socket_async(config: &TestConfig) -> Result<(u64, Duration)> {
                 udp_rx.bind(&udp_rx_addr.into())?;
                 udp_rx.into()
             };
-            udp_rx.set_nonblocking(true)?;
+            // udp_rx.set_nonblocking(true)?;
+            udp_rx.set_read_timeout(Some(Duration::from_millis(10)))?;
 
             for timer in timers.iter() {
                 bytes_recv = 0;
@@ -481,9 +482,8 @@ fn test_std_udp_socket_async(config: &TestConfig) -> Result<(u64, Duration)> {
 
                     match recv_res {
                         Ok(_) => { bytes_recv += config.payload_sz as u64; },
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            thread::yield_now();
-                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock 
+                               || e.kind() == std::io::ErrorKind::TimedOut => (),
                         Err(e) => panic!(e)
                     }
                 }
@@ -502,7 +502,8 @@ fn test_std_udp_socket_async(config: &TestConfig) -> Result<(u64, Duration)> {
         let send_thread = thread::spawn(error_printer(move || -> Result<()> {
             let data = [1u8; 1500];
             let udp_tx = UdpSocket::bind(udp_tx_addr)?;
-            udp_tx.set_nonblocking(true)?;
+            // udp_tx.set_nonblocking(true)?;
+            udp_tx.set_write_timeout(Some(Duration::from_millis(10)))?;
 
             if let ConnectionMode::Connected = config.conn_m {
                 udp_tx.connect(udp_rx_addr)?;
@@ -517,9 +518,8 @@ fn test_std_udp_socket_async(config: &TestConfig) -> Result<(u64, Duration)> {
                     };
                     match send_res {
                         Ok(_) => (),
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            thread::yield_now();
-                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock 
+                               || e.kind() == std::io::ErrorKind::TimedOut => (),
                         Err(e) => panic!(e)
                     }
                 }
@@ -818,23 +818,45 @@ async fn test_tokio_udp_socket_recv_task(
         // TODO: may hang
         while !timer.is_expired() {
             // TODO: SyncExhaustive
-            let recv_res = match config.conn_m {
-                ConnectionMode::Connected => {
-                    tokio::time::timeout(Duration::from_millis(10), udp_rx.recv(&mut data[..config.payload_sz])).await
+            match config.socket_t {
+                SocketType::TokioUdp => {
+                    let recv_res = match config.conn_m {
+                        ConnectionMode::Connected => {
+                            tokio::time::timeout(Duration::from_millis(10), udp_rx.recv(&mut data[..config.payload_sz])).await
+                        },
+                        ConnectionMode::Unconnected => {
+                            tokio::time::timeout(Duration::from_millis(10), 
+                                udp_rx.recv_from(&mut data[..config.payload_sz])
+                                    .map(|res| res.map(|ok_val| ok_val.0 ))
+                            ).await
+                        }
+                    };
+                    if let Some(res) = recv_res.ok() { res?; }
+        
+                    bytes_recv += config.payload_sz as u64;
                 },
-                ConnectionMode::Unconnected => {
-                    tokio::time::timeout(Duration::from_millis(10), 
-                        udp_rx.recv_from(&mut data[..config.payload_sz])
-                            .map(|res| res.map(|ok_val| ok_val.0 ))
-                    ).await
-                }
-            };
-            match recv_res {
-                Err(_) => Ok(Ok(0)),
-                any => any
-            }??;
+                SocketType::TokioUdpSyncExhaustive => {
+                    let readable_res = tokio::time::timeout(Duration::from_millis(10), udp_rx.readable()).await;
+                    if let Some(res) = readable_res.ok() { res?; }
+                    while !timer.is_expired() {
+                        let recv_res = match config.conn_m {
+                            ConnectionMode::Connected => {
+                                udp_rx.try_recv(&mut data[..config.payload_sz])
+                            },
+                            ConnectionMode::Unconnected => {
+                                udp_rx.try_recv_from(&mut data[..config.payload_sz]).map(|res| res.0 )
+                            }
+                        };
 
-            bytes_recv += config.payload_sz as u64;
+                        match recv_res {
+                            Ok(recv_sz) => { bytes_recv += recv_sz as u64 },
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                            Err(e) => panic!(e),
+                        }
+                    }
+                },
+                _ => unreachable!(),
+            }
         }
     }
     Ok((bytes_recv, Instant::now() - start))
@@ -854,17 +876,42 @@ async fn test_tokio_udp_socket_send_task(
         for barrier in barriers.iter() { barrier.wait().await; }
         while !timer.is_expired() {
             // TODO: SyncExhaustive
-            match config.conn_m {
-                ConnectionMode::Connected => {
-                    udp_tx.send(&data[..config.payload_sz]).await?;
-                },
-                ConnectionMode::Unconnected => {
-                    udp_tx.send_to(&data[..config.payload_sz], &udp_rx_addr).await?;
-                }
-            };
+            match config.socket_t {
+                SocketType::TokioUdp => {
+                    match config.conn_m {
+                        ConnectionMode::Connected => {
+                            udp_tx.send(&data[..config.payload_sz]).await?;
+                        },
+                        ConnectionMode::Unconnected => {
+                            udp_tx.send_to(&data[..config.payload_sz], &udp_rx_addr).await?;
+                        }
+                    };
 
-            if config.threads == 1 {
-                tokio::task::yield_now().await;
+                    if config.threads == 1 {
+                        tokio::task::yield_now().await;
+                    }
+                },
+                SocketType::TokioUdpSyncExhaustive => {
+                    let writable_res = tokio::time::timeout(Duration::from_millis(10), udp_tx.writable()).await;
+                    if let Some(res) = writable_res.ok() { res?; }
+                    while !timer.is_expired() {
+                        let send_res = match config.conn_m {
+                            ConnectionMode::Connected => {
+                                udp_tx.try_send(&data[..config.payload_sz])
+                            },
+                            ConnectionMode::Unconnected => {
+                                udp_tx.try_send_to(&data[..config.payload_sz], udp_rx_addr)
+                            }
+                        };
+
+                        match send_res {
+                            Ok(_) => (),
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                            Err(e) => panic!(e),
+                        }
+                    }
+                },
+                _ => unreachable!(),
             }
         }
     }
@@ -968,10 +1015,11 @@ fn run_test(config: &TestConfig) -> Result<()> {
 
 fn main() -> Result<()> {
     let mut test_suite = TestSuiteBuilder::default();
-    // test_suite.set_variable("threads", [ConfigValue::Threads(2), ConfigValue::Threads(4)]);
-    test_suite.set_variable("socket_t", [ConfigValue::SocketT(SocketType::MioUdpExhaustive), ConfigValue::SocketT(SocketType::TokioUdp)]);
+    test_suite.set_variable("threads", [ConfigValue::Threads(4)]);
+    // test_suite.set_variable("socket_t", [ConfigValue::SocketT(SocketType::MioUdpExhaustive), ConfigValue::SocketT(SocketType::TokioUdp)]);
+    // test_suite.set_fixed("socket_t", ConfigValue::SocketT(SocketType::StdUdp));
     test_suite.set_fixed("ip_proto", ConfigValue::IpProto(IPProtocol::V4));
-    test_suite.set_fixed("conn_m", ConfigValue::ConnM(ConnectionMode::Connected));
+    test_suite.set_fixed("conn_m", ConfigValue::ConnM(ConnectionMode::Unconnected));
     test_suite.set_fixed("payload_sz", ConfigValue::PayloadSz(300));
     let test_suite = test_suite.finish()?;
     
