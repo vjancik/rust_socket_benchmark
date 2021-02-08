@@ -406,17 +406,17 @@ fn test_std_udp_socket_sync(config: &TestConfig) -> Result<(u64, Duration)> {
         timer.start();
         start = Instant::now();
         while !timer.is_expired() {
-            match &config.conn_m {
+            let recv_sz = match &config.conn_m {
                 ConnectionMode::Connected => {
                     udp_tx.send(&data[..config.payload_sz])?;
-                    udp_rx.recv(&mut data[..config.payload_sz])?;
+                    udp_rx.recv(&mut data[..config.payload_sz])?
                 },
                 ConnectionMode::Unconnected => {
                     udp_tx.send_to(&data[..config.payload_sz], &udp_rx_addr)?;
-                    udp_rx.recv_from(&mut data[..config.payload_sz])?;
+                    udp_rx.recv_from(&mut data[..config.payload_sz])?.0
                 }
-            }
-            bytes_recv += config.payload_sz as u64;
+            };
+            bytes_recv += recv_sz as u64;
         }
     }
 
@@ -481,7 +481,7 @@ fn test_std_udp_socket_async(config: &TestConfig) -> Result<(u64, Duration)> {
                     };
 
                     match recv_res {
-                        Ok(_) => { bytes_recv += config.payload_sz as u64; },
+                        Ok(recv_sz) => { bytes_recv += recv_sz as u64; },
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock 
                                || e.kind() == std::io::ErrorKind::TimedOut => (),
                         Err(e) => panic!(e)
@@ -586,7 +586,7 @@ fn mio_udp_socket_recv_single_handler(udp_rx: &mut mio::net::UdpSocket, data: &m
         }
     };
     match recv_res {
-        Ok(_) => Ok(config.payload_sz as u64),
+        Ok(recv_sz) => Ok(recv_sz as u64),
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(0),
         Err(e) => panic!(e),
     }
@@ -831,9 +831,7 @@ async fn test_tokio_udp_socket_recv_task(
                             ).await
                         }
                     };
-                    if let Some(res) = recv_res.ok() { res?; }
-        
-                    bytes_recv += config.payload_sz as u64;
+                    if let Some(res) = recv_res.ok() { bytes_recv += res? as u64; }
                 },
                 SocketType::TokioUdpSyncExhaustive => {
                     let readable_res = tokio::time::timeout(Duration::from_millis(10), udp_rx.readable()).await;
